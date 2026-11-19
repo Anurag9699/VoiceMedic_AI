@@ -1,0 +1,59 @@
+# ── Python ──────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+backend/.venv/
+.venv/
+venv/
+env/
+
+# ── Environment / Secrets ───────────────────
+backend/.env
+.env
+*.env
+
+# ── Data / Generated files ──────────────────
+backend/data/audio/raw/
+backend/data/audio/wav_16k/
+backend/data/audio/processed/
+backend/data/audio/enrollment/
+backend/data/reports/*.pdf
+backend/data/logs/
+backend/data/*.db
+
+# ── ML Models (downloaded at runtime) ───────
+backend/pretrained_models/
+*.pt
+*.pth
+*.onnx
+
+# ── macOS ───────────────────────────────────
+.DS_Store
+*.DS_Store
+._*
+
+# ── Node / Frontend ─────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# ── IDE ──────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# ── Test / Cache ─────────────────────────────
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+pyrightconfig.json

@@ -1,0 +1,16 @@
+certifi
+fastapi>=0.115.0
+faster-whisper>=1.0.0
+google-genai
+httpx>=0.27.0
+numpy>=1.24.0
+openai-whisper>=20240930
+pytest>=8.0.0
+python-dotenv
+python-multipart>=0.0.9
+reportlab>=4.0.0
+scipy
+speechbrain>=1.0.0
+torch
+torchaudio
+uvicorn[standard]>=0.30.0

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: voicemedic-ai-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SPEAKER_VERIFICATION_THRESHOLD
+        value: "0.55"
+      - key: WHISPER_MODEL
+        value: "small"
