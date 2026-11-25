@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import uuid
@@ -7,6 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from audio.processor import (
     convert_to_16k_mono_wav,
@@ -15,8 +17,11 @@ from audio.processor import (
 )
 from audio.transcriber import SpeechServiceUnavailable, transcribe_audio
 from audio.parser import parse_medical_report
-from audio.speaker import verify_speaker, reset_enrollment, enroll_speaker, DEFAULT_THRESHOLD
-from report.generator import generate_pdf_report, save_report_to_db, get_all_reports
+from audio.speaker import (
+    DEFAULT_THRESHOLD, enroll_speaker, enrollment_sample_count,
+    is_voice_enrolled, reset_enrollment, verify_speaker,
+)
+from report.generator import count_reports, generate_pdf_report, get_all_reports, report_pdf_path, save_report_to_db
 
 logging.basicConfig(level=logging.INFO)
 
@@ -179,15 +184,8 @@ async def generate_report(
     """
     Main endpoint: Doctor speaks patient details → AI generates structured medical report + PDF.
 
-    Pipeline:
-    1. Validate & save audio
-    2. Convert to 16kHz WAV (ffmpeg)
-    3. Transcribe speech to text
-    4. Verify doctor's voice (ECAPA-TDNN)
-    5. Extract medical data (Gemini LLM)
-    6. Generate PDF report (reportlab)
-    7. Save to database (SQLite)
-    8. Return report data + PDF download link
+    Transcribe and extract the report while checking the speaker.
+    Save a PDF and history entry after both checks pass.
 
     Form fields:
         file     – audio file (any format supported by ffmpeg)
@@ -200,62 +198,78 @@ async def generate_report(
 
     # Step 1 & 2: Save & convert audio
     try:
-        raw_path, size_bytes = await save_upload_file(file, RAW_AUDIO_DIR)
-        wav_path, duration_seconds = convert_to_16k_mono_wav(raw_path, WAV_AUDIO_DIR)
+        raw_path, _ = await save_upload_file(file, RAW_AUDIO_DIR)
+        wav_path, duration_seconds = await run_in_threadpool(convert_to_16k_mono_wav, raw_path, WAV_AUDIO_DIR)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Step 3: Transcribe speech to text before running speaker verification
-    # Map "auto" sentinel to None so the transcriber triggers language auto-detection
+    # Overlap the remote request with speaker inference for an enrolled user.
+    verification = None
+    if (os.getenv("GEMINI_API_KEY") or "").strip() and is_voice_enrolled("default_doctor"):
+        verification = asyncio.create_task(
+            asyncio.to_thread(verify_speaker, str(wav_path), user_id="default_doctor")
+        )
     whisper_language: str | None = None if language == "auto" else language
     try:
-        transcription = transcribe_audio(
+        transcription = await run_in_threadpool(
+            transcribe_audio,
             wav_path,
             model_name=WHISPER_MODEL,
             language=whisper_language,
+            include_report=True,
         )
+        transcript_text = transcription["text"].strip()
+        if not transcript_text:
+            raise HTTPException(
+                status_code=422,
+                detail="No intelligible speech was detected. Please record again and speak clearly.",
+            )
+        english_translation = transcription.get("english_translation", transcript_text).strip()
+        detected_lang = transcription.get("language", "en")
+        if verification is None:
+            verification = asyncio.create_task(
+                asyncio.to_thread(verify_speaker, str(wav_path), user_id="default_doctor")
+            )
+
+        medical_data = transcription.get("medical_report")
+        if medical_data is None:
+            parse_input = (
+                f"{transcript_text}\n(English Translation: {english_translation})"
+                if english_translation and english_translation != transcript_text
+                else transcript_text
+            )
+            medical_data = await run_in_threadpool(parse_medical_report, parse_input, language=detected_lang)
+        speaker_data = await verification
     except SpeechServiceUnavailable as e:
         return JSONResponse(
             status_code=e.status_code,
             content={"detail": str(e), "code": "transcription_unavailable"},
         )
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
+    finally:
+        if verification is not None:
+            if not verification.done():
+                verification.cancel()
+            await asyncio.gather(verification, return_exceptions=True)
 
-    transcript_text = transcription["text"].strip()
-    if not transcript_text:
-        raise HTTPException(
-            status_code=422,
-            detail="No intelligible speech was detected. Please record again and speak clearly.",
-        )
-    english_translation = transcription.get("english_translation", transcript_text).strip()
-    detected_lang = transcription.get("language", "en")
-
-    # Step 4: Verify doctor's voice
-    speaker_data = verify_speaker(str(wav_path), user_id="default_doctor")
-
-    # Step 5: Extract medical data using Gemini LLM
-    # If spoken in a regional language, provide both native transcript and English translation for clinical precision
-    parse_input = (
-        f"{transcript_text}\n(English Translation: {english_translation})"
-        if english_translation and english_translation != transcript_text
-        else transcript_text
-    )
-    medical_data = parse_medical_report(parse_input, language=detected_lang)
     medical_data["transcript"] = transcript_text
     medical_data["english_translation"] = english_translation
 
     # Step 6 & 7: Generate PDF and save to DB only if doctor is verified
     report_id = str(uuid.uuid4())
     pdf_url = None
+    history_entry = None
+    report_status = "unverified"
 
-    if speaker_data.get("verified") and medical_data.get("is_valid"):
-        try:
-            pdf_path = generate_pdf_report(medical_data, report_id, doctor_name="Dr. Attending Physician")
-            save_report_to_db(report_id, "default_doctor", medical_data, pdf_path)
-            pdf_url = f"/api/report/download/{report_id}"
-        except Exception as e:
-            logging.error(f"PDF/DB error: {e}")
+    if speaker_data.get("verified"):
+        report_status = "incomplete"
+        if medical_data.get("is_valid"):
+            try:
+                history_entry = await run_in_threadpool(save_verified_report, report_id, medical_data)
+                pdf_url = f"/api/report/download/{report_id}"
+                report_status = "saved"
+            except Exception:
+                report_status = "save_failed"
+                logging.exception("Failed to save verified report %s", report_id)
 
     return {
         "status":              "success",
@@ -270,7 +284,18 @@ async def generate_report(
         "speaker_verification": speaker_data,
         "medical_report":      medical_data,
         "pdf_url":             pdf_url,
+        "report_status":       report_status,
+        "history_entry":       history_entry,
     }
+
+
+def save_verified_report(report_id: str, medical_data: dict) -> dict:
+    try:
+        pdf_path = generate_pdf_report(medical_data, report_id, doctor_name="Dr. Attending Physician")
+        return save_report_to_db(report_id, "default_doctor", medical_data, pdf_path)
+    except Exception:
+        report_pdf_path(report_id).unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +305,8 @@ async def generate_report(
 @app.get("/api/report/download/{report_id}", tags=["Report"])
 def download_report(report_id: str):
     """Download a generated PDF report by its ID."""
-    pdf_path = BASE_DIR / "data" / "reports" / f"{report_id}.pdf"
-    if not pdf_path.exists():
+    pdf_path = report_pdf_path(report_id)
+    if not pdf_path.is_file():
         raise HTTPException(status_code=404, detail="Report not found.")
     return FileResponse(
         path=str(pdf_path),
@@ -308,15 +333,11 @@ def get_report_history():
 @app.get("/api/doctor/info", tags=["Auth"])
 def get_doctor_info():
     """Check doctor enrollment status and report count."""
-    enrollment_dir = BASE_DIR / "data" / "audio" / "enrollment"
-    enrollment_file = enrollment_dir / "default_doctor_embedding.npy"
-    samples = list(enrollment_dir.glob("default_doctor_sample_*.wav"))
-    reports = get_all_reports("default_doctor")
     return {
-        "voice_enrolled": enrollment_file.exists(),
-        "sample_count":   len(samples),
+        "voice_enrolled": is_voice_enrolled("default_doctor"),
+        "sample_count":   enrollment_sample_count("default_doctor"),
         "threshold":      DEFAULT_THRESHOLD,
-        "total_reports":  len(reports),
+        "total_reports":  count_reports("default_doctor"),
     }
 
 

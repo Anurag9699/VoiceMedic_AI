@@ -33,6 +33,8 @@ from threading import Lock
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 
+from storage_paths import BASE_DIR, DATA_DIR
+
 # Load PyTorch and SpeechBrain
 try:
     import torch
@@ -45,36 +47,40 @@ except ImportError:
     logging.warning("SpeechBrain not installed. Verification will fail.")
     SpeakerRecognition = None
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-ENROLLMENT_DIR = BASE_DIR / "data" / "audio" / "enrollment"
+ENROLLMENT_DIR = DATA_DIR / "audio" / "enrollment"
 ENROLLMENT_DIR.mkdir(parents=True, exist_ok=True)
 
-AUDIT_LOG_DIR = BASE_DIR / "data" / "logs"
+AUDIT_LOG_DIR = DATA_DIR / "logs"
 AUDIT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 VERIFICATION_LOG = AUDIT_LOG_DIR / "speaker_verification.jsonl"
 
 # Lazy-loaded model singleton
 _verifier_model = None
 _enrollment_lock = Lock()
+_model_lock = Lock()
 
 
 def get_verifier() -> Optional["SpeakerRecognition"]:
     global _verifier_model
-    if _verifier_model is None and SpeakerRecognition is not None:
+    if _verifier_model is not None or SpeakerRecognition is None:
+        return _verifier_model
+    with _model_lock:
+        if _verifier_model is not None:
+            return _verifier_model
         logging.info("Loading SpeechBrain ECAPA-TDNN model...")
         if torch is not None:
-            torch.set_grad_enabled(False)
             try:
                 torch.set_num_threads(1)
             except Exception:
                 pass
-        _verifier_model = SpeakerRecognition.from_hparams(
+        model = SpeakerRecognition.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir=str(BASE_DIR / "pretrained_models" / "spkrec-ecapa-voxceleb"),
             run_opts={"device": "cpu"},
         )
-        if hasattr(_verifier_model, "mods") and hasattr(_verifier_model.mods, "classifier"):
-            del _verifier_model.mods.classifier
+        if hasattr(model, "mods") and hasattr(model.mods, "classifier"):
+            del model.mods.classifier
+        _verifier_model = model
         import gc
         gc.collect()
     return _verifier_model
@@ -511,7 +517,8 @@ def _compute_segment_embeddings(
 
         try:
             seg_tensor = torch.tensor(segment).unsqueeze(0)  # (1, T)
-            emb = verifier.encode_batch(seg_tensor)
+            with _model_lock, torch.inference_mode():
+                emb = verifier.encode_batch(seg_tensor)
             emb = emb.squeeze().detach().cpu().numpy()
 
             norm = np.linalg.norm(emb)
@@ -531,7 +538,12 @@ def _compute_segment_embeddings(
 # Embedding Computation (shared by enrollment and verification)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _compute_embedding(wav_path: str, normalize_rms: bool = True) -> Optional[np.ndarray]:
+def _compute_embedding(
+    wav_path: str,
+    normalize_rms: bool = True,
+    *,
+    segments: Optional[List[np.ndarray]] = None,
+) -> Optional[np.ndarray]:
     """
     Compute a 192-dim L2-normalised ECAPA-TDNN speaker embedding for the given WAV.
     Returns a (192,) numpy float32 array, or None on failure.
@@ -559,7 +571,7 @@ def _compute_embedding(wav_path: str, normalize_rms: bool = True) -> Optional[np
             return None
 
         # Try segment-level embeddings first for robustness
-        seg_embeddings = _compute_segment_embeddings(wav_path)
+        seg_embeddings = _compute_segment_embeddings(wav_path) if segments is None else segments
 
         if seg_embeddings:
             # Average all segment embeddings → re-normalise
@@ -574,7 +586,8 @@ def _compute_embedding(wav_path: str, normalize_rms: bool = True) -> Optional[np
             signal = _rms_normalize(signal)
 
         signal_tensor = torch.tensor(signal).unsqueeze(0)  # (1, T)
-        embedding = verifier.encode_batch(signal_tensor)
+        with _model_lock, torch.inference_mode():
+            embedding = verifier.encode_batch(signal_tensor)
         embedding = embedding.squeeze().detach().cpu().numpy()
 
         norm = np.linalg.norm(embedding)
@@ -595,6 +608,14 @@ def _compute_embedding(wav_path: str, normalize_rms: bool = True) -> Optional[np
 def _embedding_path(user_id: str) -> Path:
     """Returns the path where the averaged reference embedding is stored (.npy)."""
     return ENROLLMENT_DIR / f"{user_id}_embedding.npy"
+
+
+def is_voice_enrolled(user_id: str) -> bool:
+    return _embedding_path(user_id).is_file()
+
+
+def enrollment_sample_count(user_id: str) -> int:
+    return sum(1 for _ in ENROLLMENT_DIR.glob(f"{user_id}_sample_*.wav"))
 
 
 def _load_reference_embedding(user_id: str) -> Optional[np.ndarray]:
@@ -1019,8 +1040,7 @@ def verify_speaker(
         }
 
     # ── Determine enrollment sample count for dynamic threshold ──
-    enrollment_samples = sorted(ENROLLMENT_DIR.glob(f"{user_id}_sample_*.wav"))
-    enrollment_count = len(enrollment_samples)
+    enrollment_count = enrollment_sample_count(user_id)
 
     # ── Resolve threshold ──
     if use_dynamic:
@@ -1090,8 +1110,8 @@ def verify_speaker(
         segment_score_max = 0.0
 
     # ── Overall embedding (averaged from segments or whole-file fallback) ──
-    current_embedding = _compute_embedding(audio_path)
-    if current_embedding is None:
+    current_embedding = None if segment_scores else _compute_embedding(audio_path, segments=seg_embeddings)
+    if not segment_scores and current_embedding is None:
         return {
             "verified": False,
             "confidence_score": 0.0,

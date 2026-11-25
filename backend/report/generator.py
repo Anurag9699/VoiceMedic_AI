@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-REPORTS_DIR = BASE_DIR / "data" / "reports"
+from storage_paths import DATA_DIR
+
+REPORTS_DIR = DATA_DIR / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = BASE_DIR / "data" / "reports.db"
+DB_PATH = DATA_DIR / "reports.db"
 
 
 def init_db():
@@ -29,11 +30,15 @@ def init_db():
             report_json TEXT
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS reports_by_doctor_date ON reports (doctor_id, timestamp DESC)")
     conn.commit()
     conn.close()
 
 
 init_db()
+
+def report_pdf_path(report_id: str) -> Path:
+    return REPORTS_DIR / f"{report_id}.pdf"
 
 
 def generate_pdf_report(
@@ -55,7 +60,7 @@ def generate_pdf_report(
         )
         from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
 
-        pdf_path = REPORTS_DIR / f"{report_id}.pdf"
+        pdf_path = report_pdf_path(report_id)
         doc = SimpleDocTemplate(
             str(pdf_path),
             pagesize=A4,
@@ -412,25 +417,37 @@ def generate_pdf_report(
 
 def save_report_to_db(report_id: str, doctor_id: str, report_data: Dict[str, Any], pdf_path: str):
     """Save report metadata to SQLite."""
+    summary = {
+        "id": report_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "patient_name": report_data.get("patient_name"),
+        "age": report_data.get("age"),
+        "gender": report_data.get("gender"),
+        "diagnosis": report_data.get("suggested_diagnosis"),
+    }
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        INSERT OR REPLACE INTO reports (id, timestamp, doctor_id, patient_name, age, gender,
-                             symptoms, diagnosis, pdf_path, report_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        report_id,
-        datetime.now(timezone.utc).isoformat(),
-        doctor_id,
-        report_data.get('patient_name'),
-        report_data.get('age'),
-        report_data.get('gender'),
-        json.dumps(report_data.get('symptoms', [])),
-        report_data.get('suggested_diagnosis'),
-        pdf_path,
-        json.dumps(report_data)
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        with conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO reports (id, timestamp, doctor_id, patient_name, age, gender,
+                                     symptoms, diagnosis, pdf_path, report_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                report_id, summary["timestamp"], doctor_id, summary["patient_name"], summary["age"],
+                summary["gender"], json.dumps(report_data.get("symptoms", [])), summary["diagnosis"],
+                str(pdf_path), json.dumps(report_data),
+            ))
+    finally:
+        conn.close()
+    return summary
+
+
+def count_reports(doctor_id: str = "default_doctor") -> int:
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM reports WHERE doctor_id=?", (doctor_id,)).fetchone()[0]
+    finally:
+        conn.close()
 
 
 def get_all_reports(doctor_id: str = "default_doctor") -> list:

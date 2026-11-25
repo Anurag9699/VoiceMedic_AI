@@ -30,6 +30,25 @@ LANGUAGE_NAMES = {
     "en": "English",
 }
 
+CLINICAL_REPORT_FIELDS = """Use fields patient_name, age, gender, symptoms, duration, vitals,
+medical_history, suggested_diagnosis, recommended_tests, prescription, notes, and is_valid.
+Include stated blood_pressure, pulse, temperature, spo2 and weight in vitals. Preserve units,
+medication names, doses and frequencies. Include only facts stated in the consultation.
+Use null for missing scalar fields, empty arrays for missing symptoms and tests, and an empty
+object for missing vitals. Use is_valid=true only if the recording contains usable clinical
+information, such as the patient's name or age, symptoms, vitals, or a stated diagnosis."""
+
+
+def normalize_gemini_report(data: dict) -> dict:
+    report = {**data, "method": "gemini_llm", "is_valid": data.get("is_valid") is True}
+    for field in ("symptoms", "recommended_tests"):
+        if not isinstance(report.get(field), list):
+            report[field] = []
+    if not isinstance(report.get("vitals"), dict):
+        report["vitals"] = {}
+    return report
+
+
 def get_gemini_client():
     global _gemini_client
     if _gemini_client is not None:
@@ -203,13 +222,7 @@ Return ONLY this JSON (no markdown, no explanation):
                     lines = lines[:-1]
                 resp_text = "\n".join(lines).strip()
 
-            data = json.loads(resp_text)
-            data["method"] = "gemini_llm"
-            # Ensure array fields are lists
-            data["symptoms"] = data.get("symptoms") or []
-            data["recommended_tests"] = data.get("recommended_tests") or []
-            data["vitals"] = data.get("vitals") or {}
-            return data
+            return normalize_gemini_report(json.loads(resp_text))
 
         except Exception as e:
             logging.error(f"Gemini medical parsing failed: {e}. Falling back to Regex.")

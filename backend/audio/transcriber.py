@@ -21,6 +21,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 from . import GEMINI_MODELS
+from .parser import CLINICAL_REPORT_FIELDS, normalize_gemini_report
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ class SpeechServiceUnavailable(RuntimeError):
 def _transcribe_with_gemini(
     wav_path: Path,
     language: str | None = None,
+    include_report: bool = False,
 ) -> dict | None:
     """
     State-of-the-art multilingual ASR using Gemini multimodal audio.
@@ -244,6 +246,12 @@ Translate only the transcribed words into English. Copy the transcript if it is 
 Return a JSON object with text, language, language_name, english_translation, and confidence.
 Use the primary spoken language for language and language_name, and give confidence as a number from 0 to 1.
 """
+        if include_report:
+            prompt += (
+                "\nAlso include a medical_report JSON object, based on the transcribed words. "
+                "Use both the original language and the English translation when extracting fields.\n"
+                + CLINICAL_REPORT_FIELDS
+            )
         response = None
         failures = []
         used_model = None
@@ -257,7 +265,12 @@ Use the primary spoken language for language and language_name, and give confide
                             types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
                             prompt,
                         ],
-                        config=types.GenerateContentConfig(response_mime_type="application/json"),
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            thinking_config=types.ThinkingConfig(
+                                thinking_level="low" if model == "gemini-3.8-flash" else "minimal",
+                            ),
+                        ),
                     )
                     if response and response.text:
                         used_model = model
@@ -286,7 +299,7 @@ Use the primary spoken language for language and language_name, and give confide
         detected_lang = data.get("language") or language or "en"
         english_trans = (data.get("english_translation") or text).strip()
 
-        return {
+        result = {
             "text": text,
             "language": detected_lang,
             "language_name": data.get("language_name", detected_lang),
@@ -295,6 +308,9 @@ Use the primary spoken language for language and language_name, and give confide
             "model_used": f"{used_model or 'gemini'} (multimodal ASR)",
             "confidence": float(data.get("confidence", 0.0 if not text else 0.95)),
         }
+        if include_report and isinstance(data.get("medical_report"), dict):
+            result["medical_report"] = normalize_gemini_report(data["medical_report"])
+        return result
     except SpeechServiceUnavailable:
         raise
     except Exception as exc:
@@ -311,6 +327,7 @@ def transcribe_audio(
     model_name: str = "tiny",
     language: str | None = None,
     force_whisper: bool = False,
+    include_report: bool = False,
 ) -> dict:
     """
     Transcribe the given WAV file using the premier available ASR model.
@@ -354,7 +371,7 @@ def transcribe_audio(
     is_cloud = bool(os.getenv("RENDER") or os.getenv("ENVIRONMENT") == "production")
     if not force_whisper:
         try:
-            gemini_result = _transcribe_with_gemini(wav_path, language=language)
+            gemini_result = _transcribe_with_gemini(wav_path, language=language, include_report=include_report)
             if gemini_result is not None:
                 logger.info("Transcription completed with %s.", gemini_result.get("model_used", "Gemini"))
                 return gemini_result

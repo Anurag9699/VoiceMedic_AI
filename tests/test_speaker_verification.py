@@ -499,6 +499,7 @@ class TestVerification:
             assert result["verified"] is True
             assert result["confidence_score"] > 0.99
             assert result["confidence_band"] == "high"
+            assert mock_verifier.encode_batch.call_count == len(result["segment_scores"])
 
     def test_verify_rejects_different_speaker(self, good_wav):
         """Verification should fail when embeddings are very different (different speaker)."""

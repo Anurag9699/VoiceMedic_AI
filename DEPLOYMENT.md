@@ -116,6 +116,12 @@ docker compose up -d --build
 
 ## 🔒 Verification & Troubleshooting Checklist
 
+### Keep report history and voice enrollment across restarts
+
+The backend stores report history, PDFs, and enrollment files together. For a Docker deployment on Render, attach a persistent disk at `/app/data` on a compatible service plan. For a different mount path, set `VOICEMEDIC_DATA_DIR` to its absolute path. If you already have a data directory to keep, copy it to the mount while the backend is stopped. Render's free web service clears files stored on its local filesystem when it restarts or spins down. [Render persistent disks](https://render.com/docs/disks)
+
+### Check the deployment
+
 1. **Verify Backend Health**:
    Visit `https://<YOUR-BACKEND-URL>/health` in your browser. It should return:
    ```json

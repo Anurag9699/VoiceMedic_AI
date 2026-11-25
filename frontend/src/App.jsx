@@ -233,6 +233,9 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState(null);
+  const historyRequestRef = useRef(0);
   const captureRef = useRef(null);
 
   const fetchDoctorInfo = async () => {
@@ -243,13 +246,18 @@ export default function App() {
   };
 
   const fetchHistory = async () => {
+    const request = ++historyRequestRef.current;
+    setHistoryLoading(true);
+    setHistoryError(null);
     try {
       const r = await fetch(`${API_BASE}/api/reports/history`);
-      if (r.ok) {
-        const d = await r.json();
-        setHistory(d.reports || []);
-      }
-    } catch { }
+      const d = await readApiResponse(r);
+      if (request === historyRequestRef.current) setHistory(d.reports || []);
+    } catch {
+      if (request === historyRequestRef.current) setHistoryError('Could not load report history.');
+    } finally {
+      if (request === historyRequestRef.current) setHistoryLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -426,6 +434,11 @@ export default function App() {
       const d = await readApiResponse(r);
       setResult(d);
       setRecState('done');
+      if (d.history_entry) {
+        const entry = d.history_entry;
+        setHistory(items => [entry, ...items.filter(item => item.id !== entry.id)]);
+      }
+      if (d.pdf_url) setShowHistory(true);
       fetchDoctorInfo();
       fetchHistory();
     } catch (err) {
@@ -1100,31 +1113,18 @@ export default function App() {
 
           {/* UPLOADING / PROCESSING STATE */}
           {recState === 'uploading' && (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 18, padding: '28px 0' }}>
+            <div role="status" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, padding: '20px 0' }}>
               <div
                 style={{
-                  width: 44,
-                  height: 44,
-                  border: `3px solid ${G.borderSubtle}`,
-                  borderTop: `3px solid ${G.white}`,
+                  width: 20,
+                  height: 20,
+                  border: `2px solid ${G.borderSubtle}`,
+                  borderTop: `2px solid ${G.white}`,
                   borderRadius: '50%',
                   animation: 'spin 0.85s linear infinite',
                 }}
               />
-              <div
-                style={{
-                  color: G.silverMid,
-                  fontSize: 13,
-                  textAlign: 'center',
-                  lineHeight: 2.2,
-                  fontFamily: "'JetBrains Mono', monospace",
-                }}
-              >
-                <div>[1/4] ECAPA-TDNN Speaker Biometric Verification…</div>
-                <div>[2/4] Whisper Automatic Speech Recognition…</div>
-                <div>[3/4] Gemini 2.5 Flash Clinical Extraction…</div>
-                <div>[4/4] Generating Standard Medical PDF…</div>
-              </div>
+              <span style={{ color: G.silverMid, fontSize: 13 }}>Preparing your report…</span>
             </div>
           )}
 
@@ -1209,7 +1209,7 @@ export default function App() {
                       </strong>
                     </span>
                   )}
-                  {sv?.anti_spoof && !sv.anti_spoof.passed && (
+                  {sv?.anti_spoof?.is_suspicious && (
                     <span style={{ color: '#ff6b6b' }}>⚠ Spoof detected</span>
                   )}
                 </div>
@@ -1482,7 +1482,9 @@ export default function App() {
                       fontSize: 13,
                     }}
                   >
-                    ⚠ Transcript did not contain enough clinical structure to generate a PDF.
+                    {result.report_status === 'save_failed'
+                      ? 'The report could not be saved. Your transcript is available above.'
+                      : 'Add patient or consultation details to create a report.'}
                   </div>
                 ) : null}
 
@@ -1555,10 +1557,13 @@ export default function App() {
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <SectionLabel>Clinical Report History</SectionLabel>
-              <Tag>{history.length}</Tag>
+              <Tag>{history.length || (historyLoading || historyError ? '—' : 0)}</Tag>
             </div>
             <button
-              onClick={() => setShowHistory(p => !p)}
+              onClick={() => {
+                if (!showHistory) fetchHistory();
+                setShowHistory(!showHistory);
+              }}
               style={{
                 background: G.surface2,
                 border: `1px solid ${G.borderDefault}`,
@@ -1574,7 +1579,14 @@ export default function App() {
             </button>
           </div>
 
-          {showHistory && history.length === 0 && (
+          {showHistory && historyLoading && history.length === 0 && <p role="status">Loading history…</p>}
+          {showHistory && historyError && (
+            <p role="alert">
+              {historyError}{' '}
+              <button type="button" onClick={fetchHistory}>Retry</button>
+            </p>
+          )}
+          {showHistory && !historyLoading && !historyError && history.length === 0 && (
             <p
               style={{
                 color: G.silverFaint,

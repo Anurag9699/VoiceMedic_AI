@@ -2,6 +2,7 @@ import io
 import sys
 import wave
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock, patch
 
 # Add backend directory to sys.path
@@ -146,6 +147,73 @@ def test_generate_report_valid_audio(client):
     assert "medical_report" in data
     assert data["speaker_verification"]["verified"] is True
     assert data["pdf_url"] is not None
+    assert data["report_status"] == "saved"
+    assert data["history_entry"]["id"] == data["report_id"]
+    assert client.get(data["pdf_url"]).content.startswith(b"%PDF-")
+    history = client.get("/api/reports/history").json()
+    assert any(entry["id"] == data["report_id"] for entry in history["reports"])
+
+
+def test_cloud_extraction_and_verification_overlap(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    verification_started = Event()
+    transcript_started = Event()
+    combined_result = {
+        **FAKE_MEDICAL_TRANSCRIPT,
+        "medical_report": {"is_valid": True, "patient_name": "Test Patient", "age": 45},
+    }
+
+    def transcribe(*args, **kwargs):
+        assert kwargs["include_report"]
+        transcript_started.set()
+        assert verification_started.wait(2)
+        return combined_result
+
+    def verify(*args, **kwargs):
+        verification_started.set()
+        assert transcript_started.wait(2)
+        return FAKE_VERIFICATION_SUCCESS
+
+    with (
+        patch("main.is_voice_enrolled", return_value=True),
+        patch("main.transcribe_audio", side_effect=transcribe),
+        patch("main.verify_speaker", side_effect=verify),
+        patch("main.parse_medical_report") as parse,
+    ):
+        response = client.post(
+            "/api/report/generate",
+            files={"file": ("consultation.wav", make_wav_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["report_status"] == "saved"
+    parse.assert_not_called()
+
+
+def test_unverified_report_is_kept_out_of_history(client):
+    with patch("main.verify_speaker", return_value={"verified": False}):
+        response = client.post(
+            "/api/report/generate",
+            files={"file": ("consultation.wav", make_wav_bytes(), "audio/wav")},
+        )
+    assert response.status_code == 200
+    assert response.json()["report_status"] == "unverified"
+    assert response.json()["history_entry"] is None
+    assert response.json()["pdf_url"] is None
+
+
+def test_failed_history_write_removes_the_pdf_and_reports_the_failure(client):
+    with patch("main.save_report_to_db", side_effect=OSError("storage unavailable")):
+        response = client.post(
+            "/api/report/generate",
+            files={"file": ("consultation.wav", make_wav_bytes(), "audio/wav")},
+        )
+    assert response.status_code == 200
+    report = response.json()
+    assert report["report_status"] == "save_failed"
+    assert report["history_entry"] is None
+    assert report["pdf_url"] is None
+    assert client.get(f"/api/report/download/{report['report_id']}").status_code == 404
 
 
 def test_generate_report_rejects_empty_transcript(client):
