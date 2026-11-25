@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Dict, Any
 from dotenv import load_dotenv
 
+from . import GEMINI_MODELS
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 load_dotenv()
@@ -165,7 +167,7 @@ Return ONLY this JSON (no markdown, no explanation):
 """
             response = None
             last_err = None
-            for m in ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest']:
+            for m in GEMINI_MODELS:
                 try:
                     response = client.models.generate_content(
                         model=m,

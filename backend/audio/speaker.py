@@ -28,6 +28,8 @@ import shutil
 import logging
 import numpy as np
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from threading import Lock
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -53,6 +55,7 @@ VERIFICATION_LOG = AUDIT_LOG_DIR / "speaker_verification.jsonl"
 
 # Lazy-loaded model singleton
 _verifier_model = None
+_enrollment_lock = Lock()
 
 
 def get_verifier() -> Optional["SpeakerRecognition"]:
@@ -767,11 +770,12 @@ def reset_enrollment(user_id: str = "default_doctor") -> bool:
         f"{user_id}_sample_*.wav",
         f"{user_id}_embedding.npy",
     ]
-    for pattern in patterns:
-        for f in ENROLLMENT_DIR.glob(pattern):
-            f.unlink()
-            deleted = True
-            logging.info(f"Deleted enrollment file: {f.name}")
+    with _enrollment_lock:
+        for pattern in patterns:
+            for f in ENROLLMENT_DIR.glob(pattern):
+                f.unlink()
+                deleted = True
+                logging.info(f"Deleted enrollment file: {f.name}")
     return deleted
 
 
@@ -782,7 +786,7 @@ def enroll_speaker(
 ) -> Dict[str, Any]:
     """
     Enroll the doctor's voice. Each call adds one more sample.
-    If reset=True, any existing baseline is cleared first.
+    If reset=True, replace the existing baseline after validating the new sample.
 
     Improvements over previous version:
     1. Audio quality gate checks SNR, speech ratio, clipping
@@ -791,9 +795,6 @@ def enroll_speaker(
     4. All samples averaged into a single robust reference embedding
     5. Enrollment quality score (0-100) added to response
     """
-    if reset:
-        reset_enrollment(user_id)
-
     # ── Audio quality gate ──
     quality = assess_audio_quality(audio_path, min_duration=MIN_ENROLLMENT_DURATION_SECONDS)
     if not quality["passed"]:
@@ -824,73 +825,57 @@ def enroll_speaker(
             "Check that the audio contains clear speech."
         )
 
-    # ── Check consistency with existing samples ──
-    existing_samples = sorted(ENROLLMENT_DIR.glob(f"{user_id}_sample_*.wav"))
-    if existing_samples and not reset:
-        # Verify new sample is from the same speaker as existing ones
-        existing_embeddings = []
-        for sp in existing_samples:
-            emb = _compute_embedding(str(sp))
-            if emb is not None:
-                existing_embeddings.append(emb)
+    with _enrollment_lock:
+        existing_samples = sorted(ENROLLMENT_DIR.glob(f"{user_id}_sample_*.wav"))
+        if not reset and len(existing_samples) >= MAX_ENROLLMENT_SAMPLES:
+            raise ValueError(
+                f"Maximum enrollment samples ({MAX_ENROLLMENT_SAMPLES}) reached. "
+                f"Reset and re-enroll to update your voice profile."
+            )
 
-        if existing_embeddings:
-            similarities = [_cosine_similarity(new_embedding, e) for e in existing_embeddings]
-            avg_similarity = np.mean(similarities)
-            min_similarity = np.min(similarities)
-
-            if min_similarity < MIN_INTER_SAMPLE_SIMILARITY:
+        embeddings = [new_embedding]
+        snr_values = [quality["snr_db"]]
+        for sample in [] if reset else existing_samples:
+            embedding = _compute_embedding(str(sample))
+            if embedding is None:
+                continue
+            similarity = _cosine_similarity(new_embedding, embedding)
+            if similarity < MIN_INTER_SAMPLE_SIMILARITY:
                 raise ValueError(
                     f"New sample doesn't match existing enrollment "
-                    f"(similarity {min_similarity:.2f}, need ≥{MIN_INTER_SAMPLE_SIMILARITY}). "
+                    f"(similarity {similarity:.2f}, need ≥{MIN_INTER_SAMPLE_SIMILARITY}). "
                     f"This could mean a different person is trying to enroll. "
                     f"If you changed microphones, use 'Reset & Record Fresh Voice'."
                 )
-
-    # ── Enforce maximum samples ──
-    if len(existing_samples) >= MAX_ENROLLMENT_SAMPLES and not reset:
-        raise ValueError(
-            f"Maximum enrollment samples ({MAX_ENROLLMENT_SAMPLES}) reached. "
-            f"Reset and re-enroll to update your voice profile."
-        )
-
-    # ── Save the new sample WAV ──
-    sample_num = len(existing_samples) + 1
-    sample_path = ENROLLMENT_DIR / f"{user_id}_sample_{sample_num}.wav"
-    shutil.copy2(audio_path, sample_path)
-    logging.info(f"Saved enrollment sample {sample_num} for {user_id} ({quality['duration']:.1f}s)")
-
-    # ── Re-compute ALL embeddings and average them ──
-    all_samples = sorted(ENROLLMENT_DIR.glob(f"{user_id}_sample_*.wav"))
-    embeddings: List[np.ndarray] = []
-    snr_values: List[float] = []
-
-    for sp in all_samples:
-        emb = _compute_embedding(str(sp))
-        if emb is not None:
-            embeddings.append(emb)
-            # Gather SNR for each sample
+            embeddings.append(embedding)
             try:
-                sig, s_sr = _read_wav_signal(str(sp))
-                snr_values.append(_estimate_snr(sig, s_sr))
+                signal, sr = _read_wav_signal(str(sample))
+                snr_values.append(_estimate_snr(signal, sr))
             except Exception:
                 snr_values.append(quality["snr_db"])
 
-    if not embeddings:
-        raise RuntimeError(
-            "Failed to compute embeddings from enrollment audio. "
-            "Check SpeechBrain installation."
-        )
+        avg_embedding = np.mean(embeddings, axis=0)
+        norm = np.linalg.norm(avg_embedding)
+        if norm > 0:
+            avg_embedding = avg_embedding / norm
 
-    # Average → re-normalise
-    avg_embedding = np.mean(embeddings, axis=0)
-    norm = np.linalg.norm(avg_embedding)
-    if norm > 0:
-        avg_embedding = avg_embedding / norm
-    avg_embedding = avg_embedding.astype(np.float32)
+        sample_num = 1 if reset else len(existing_samples) + 1
+        sample_path = ENROLLMENT_DIR / f"{user_id}_sample_{sample_num}.wav"
+        with TemporaryDirectory(dir=ENROLLMENT_DIR) as staging:
+            staged_sample = Path(staging) / "sample.wav"
+            staged_embedding = Path(staging) / "embedding.npy"
+            shutil.copy2(audio_path, staged_sample)
+            np.save(staged_embedding, avg_embedding.astype(np.float32))
+            staged_sample.replace(sample_path)
+            staged_embedding.replace(_embedding_path(user_id))
 
-    # Persist averaged embedding
-    np.save(str(_embedding_path(user_id)), avg_embedding)
+        if reset:
+            for previous_sample in existing_samples:
+                if previous_sample != sample_path:
+                    previous_sample.unlink()
+            (ENROLLMENT_DIR / f"{user_id}.wav").unlink(missing_ok=True)
+
+    logging.info(f"Saved enrollment sample {sample_num} for {user_id} ({quality['duration']:.1f}s)")
     logging.info(
         f"Averaged embedding updated from {len(embeddings)} sample(s) for {user_id}"
     )

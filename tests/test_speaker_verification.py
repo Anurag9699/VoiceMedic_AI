@@ -611,6 +611,22 @@ class TestEnrollment:
         with pytest.raises(ValueError, match="silence|speech|quality|insufficient"):
             enroll_speaker(silent_wav, user_id="test_doctor", reset=True)
 
+    def test_rejected_replacement_keeps_existing_enrollment(self, tmp_path, silent_wav, monkeypatch):
+        from audio import speaker
+
+        monkeypatch.setattr(speaker, "ENROLLMENT_DIR", tmp_path)
+        sample = tmp_path / "test_doctor_sample_1.wav"
+        sample.write_bytes(b"existing sample")
+        reference = tmp_path / "test_doctor_embedding.npy"
+        embedding = np.ones(192, dtype=np.float32)
+        np.save(reference, embedding)
+
+        with pytest.raises(ValueError, match="silence"):
+            speaker.enroll_speaker(silent_wav, user_id="test_doctor", reset=True)
+
+        assert sample.read_bytes() == b"existing sample"
+        np.testing.assert_array_equal(np.load(reference), embedding)
+
     def test_reset_enrollment_clears_files(self, tmp_dir):
         """Reset should delete all enrollment files for the user."""
         from unittest.mock import patch

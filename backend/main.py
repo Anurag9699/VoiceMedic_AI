@@ -160,7 +160,10 @@ async def enroll_voice(
             "voice_enrolled": True,
             **res
         }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
+        logging.exception("Voice enrollment failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -218,6 +221,11 @@ async def generate_report(
         raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
 
     transcript_text = transcription["text"].strip()
+    if not transcript_text:
+        raise HTTPException(
+            status_code=422,
+            detail="No intelligible speech was detected. Please record again and speak clearly.",
+        )
     english_translation = transcription.get("english_translation", transcript_text).strip()
     detected_lang = transcription.get("language", "en")
 

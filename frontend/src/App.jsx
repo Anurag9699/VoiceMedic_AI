@@ -22,6 +22,29 @@ const getBestMimeType = () => {
   return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
 };
 
+const stopTracks = stream => stream?.getTracks().forEach(track => track.stop());
+
+function releaseCapture(captureRef) {
+  const capture = captureRef.current;
+  captureRef.current = null;
+  clearInterval(capture?.timer);
+  stopTracks(capture?.stream);
+}
+
+async function readApiResponse(response) {
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(data?.detail || `The server returned HTTP ${response.status}. Please try again.`);
+  }
+  if (!data) throw new Error('The voice API did not return JSON. Check the backend URL.');
+  return data;
+}
+
+function attachRecording(form, blob, name) {
+  const extension = blob.type.includes('ogg') ? 'ogg' : blob.type.includes('mp4') ? 'mp4' : 'webm';
+  form.append('file', blob, `${name}.${extension}`);
+}
+
 const fmt = s =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
@@ -200,9 +223,6 @@ export default function App() {
   const [enrollState, setEnrollState] = useState('idle');
   const [enrollError, setEnrollError] = useState(null);
   const [enrollElapsed, setEnrollElapsed] = useState(0);
-  const enrollRecorderRef = useRef(null);
-  const enrollChunksRef = useRef([]);
-  const enrollTimerRef = useRef(null);
 
   const [recState, setRecState] = useState('idle');
   const [result, setResult] = useState(null);
@@ -210,9 +230,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState(0);
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
-  const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
-  const timerRef = useRef(null);
+  const captureRef = useRef(null);
 
   const fetchDoctorInfo = async () => {
     try {
@@ -234,77 +252,121 @@ export default function App() {
   useEffect(() => {
     fetchDoctorInfo();
     fetchHistory();
+    return () => releaseCapture(captureRef);
   }, []);
 
-  // ── Voice Enrollment ───────────────────────────────────────────────────────
-  const startEnroll = async (resetBaseline = false) => {
-    setEnrollError(null);
+  useEffect(() => {
+    if (enrollState !== 'success') return;
+    const timer = setTimeout(() => {
+      setEnrollMode(false);
+      setEnrollState('idle');
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [enrollState]);
+
+  const startCapture = async ({ kind, setState, setCaptureError, setTime, minBytes, emptyMessage, upload }) => {
+    if (captureRef.current) return;
+    const capture = { kind };
+    captureRef.current = capture;
+    setCaptureError(null);
+    setTime(0);
+    setState('requesting');
+
+    const fail = message => {
+      if (captureRef.current !== capture) return;
+      releaseCapture(captureRef);
+      setCaptureError(message);
+      setState('idle');
+    };
+
     try {
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+        throw new Error('Microphone recording requires a supported browser on HTTPS or localhost.');
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
+      if (captureRef.current !== capture) {
+        stopTracks(stream);
+        return;
+      }
+
+      capture.stream = stream;
       const mime = getBestMimeType();
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
-      enrollRecorderRef.current = rec;
-      enrollChunksRef.current = [];
+      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+      capture.recorder = recorder;
+      const chunks = [];
 
-      rec.ondataavailable = e => {
-        if (e.data?.size > 0) enrollChunksRef.current.push(e.data);
+      recorder.ondataavailable = event => {
+        if (event.data.size) chunks.push(event.data);
       };
-
-      rec.onstop = () => {
-        const m = rec.mimeType || 'audio/webm';
-        const blob = new Blob(enrollChunksRef.current, { type: m });
-        stream.getTracks().forEach(t => t.stop());
-        if (blob.size < 1000) {
-          setEnrollError('Audio sample too short or silent. Speak clearly for 5+ seconds.');
-          setEnrollState('idle');
+      recorder.onerror = () => fail('Microphone recording failed. Please try again.');
+      recorder.onstop = () => {
+        if (captureRef.current !== capture) return;
+        if (!capture.submit) {
+          fail('The microphone stopped before you finished recording. Please try again.');
           return;
         }
-        uploadEnroll(blob, m, resetBaseline);
+        const blob = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || 'audio/webm' });
+        if (blob.size < minBytes) {
+          fail(emptyMessage);
+          return;
+        }
+        releaseCapture(captureRef);
+        upload(blob);
       };
 
-      rec.start();
-      setEnrollElapsed(0);
-      setEnrollState('recording');
-      enrollTimerRef.current = setInterval(() => setEnrollElapsed(s => s + 1), 1000);
+      recorder.start();
+      setState('recording');
+      capture.timer = setInterval(() => setTime(s => s + 1), 1000);
     } catch (err) {
-      setEnrollError(err.name === 'NotAllowedError' ? 'Microphone permission denied.' : err.message);
+      fail(err.name === 'NotAllowedError' ? 'Microphone access denied. Allow access and try again.' : err.message);
     }
   };
 
-  const stopEnroll = () => {
-    clearInterval(enrollTimerRef.current);
-    const rec = enrollRecorderRef.current;
-    if (rec?.state === 'recording') {
-      rec.requestData();
-      setTimeout(() => {
-        if (rec.state !== 'inactive') rec.stop();
-      }, 150);
-    }
+  const stopCapture = (kind, setState) => {
+    const capture = captureRef.current;
+    if (capture?.kind !== kind || capture.recorder?.state !== 'recording') return;
+    capture.submit = true;
+    clearInterval(capture.timer);
+    setState('uploading');
+    capture.recorder.stop();
   };
 
-  const uploadEnroll = async (blob, mime, isReset = false) => {
-    setEnrollState('uploading');
-    const ext = (mime || blob.type).includes('ogg')
-      ? 'ogg'
-      : (mime || blob.type).includes('mp4')
-        ? 'mp4'
-        : 'webm';
+  const startEnroll = (resetBaseline = false) => startCapture({
+    kind: 'enroll',
+    setState: setEnrollState,
+    setCaptureError: setEnrollError,
+    setTime: setEnrollElapsed,
+    minBytes: 1000,
+    emptyMessage: 'Audio sample too short or silent. Speak clearly for 5+ seconds.',
+    upload: blob => uploadEnroll(blob, resetBaseline),
+  });
+
+  const closeEnrollment = () => {
+    if (captureRef.current?.kind === 'enroll' && !captureRef.current.submit) {
+      releaseCapture(captureRef);
+      setEnrollState('idle');
+    }
+    setEnrollError(null);
+    setEnrollMode(false);
+  };
+
+  const uploadEnroll = async (blob, isReset) => {
     const fd = new FormData();
-    fd.append('file', blob, `enroll.${ext}`);
+    attachRecording(fd, blob, 'enroll');
     if (isReset) fd.append('reset', 'true');
 
     try {
       const r = await fetch(`${API_BASE}/api/audio/enroll`, { method: 'POST', body: fd });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || `Error ${r.status}`);
+      const d = await readApiResponse(r);
+      setDoctorInfo(info => ({
+        ...info,
+        voice_enrolled: d.voice_enrolled,
+        sample_count: d.total_samples_averaged,
+        enrollment_quality_score: d.enrollment_quality_score,
+      }));
       setEnrollState('success');
-      fetchDoctorInfo();
-      setTimeout(() => {
-        setEnrollMode(false);
-        setEnrollState('idle');
-      }, 2000);
     } catch (err) {
       setEnrollError(`Enrollment failed: ${err.message}`);
       setEnrollState('idle');
@@ -316,8 +378,7 @@ export default function App() {
       return;
     try {
       const r = await fetch(`${API_BASE}/api/doctor/reset-voice`, { method: 'POST' });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || 'Reset failed');
+      await readApiResponse(r);
       fetchDoctorInfo();
       setEnrollState('idle');
       setEnrollError(null);
@@ -326,80 +387,35 @@ export default function App() {
     }
   };
 
-  // ── Report Recording ───────────────────────────────────────────────────────
-  const startRecording = async () => {
-    setError(null);
+  const startRecording = () => {
     setResult(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      const mime = getBestMimeType();
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
-      mediaRecorderRef.current = rec;
-      chunksRef.current = [];
-
-      rec.ondataavailable = e => {
-        if (e.data?.size > 0) chunksRef.current.push(e.data);
-      };
-
-      rec.onstop = () => {
-        const m = rec.mimeType || 'audio/webm';
-        const blob = new Blob(chunksRef.current, { type: m });
-        stream.getTracks().forEach(t => t.stop());
-        if (blob.size < 500) {
-          setError('Empty recording detected. Check your microphone.');
-          setRecState('idle');
-          return;
-        }
-        uploadAudio(blob, m);
-      };
-
-      rec.start();
-      setElapsed(0);
-      setRecState('recording');
-      timerRef.current = setInterval(() => setElapsed(s => s + 1), 1000);
-    } catch (err) {
-      setError(err.name === 'NotAllowedError' ? 'Microphone access denied.' : err.message);
-    }
-  };
-
-  const stopRecording = () => {
-    clearInterval(timerRef.current);
-    const rec = mediaRecorderRef.current;
-    if (rec?.state === 'recording') {
-      rec.requestData();
-      setTimeout(() => {
-        if (rec.state !== 'inactive') rec.stop();
-        setRecState('uploading');
-      }, 150);
-    } else {
-      setRecState('uploading');
-    }
+    startCapture({
+      kind: 'report',
+      setState: setRecState,
+      setCaptureError: setError,
+      setTime: setElapsed,
+      minBytes: 500,
+      emptyMessage: 'Empty recording detected. Check your microphone.',
+      upload: uploadAudio,
+    });
   };
 
   const resetRecorder = () => {
-    clearInterval(timerRef.current);
+    if (captureRef.current?.kind === 'report') releaseCapture(captureRef);
     setRecState('idle');
     setResult(null);
     setError(null);
     setElapsed(0);
   };
 
-  const uploadAudio = async (blob, mime) => {
-    const ext = (mime || blob.type).includes('ogg')
-      ? 'ogg'
-      : (mime || blob.type).includes('mp4')
-        ? 'mp4'
-        : 'webm';
+  const uploadAudio = async blob => {
     const fd = new FormData();
-    fd.append('file', blob, `recording.${ext}`);
+    attachRecording(fd, blob, 'recording');
     fd.append('language', selectedLanguage);
 
     try {
       const r = await fetch(`${API_BASE}/api/report/generate`, { method: 'POST', body: fd });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || `Error ${r.status}`);
+      const d = await readApiResponse(r);
       setResult(d);
       setRecState('done');
       fetchDoctorInfo();
@@ -410,6 +426,8 @@ export default function App() {
     }
   };
 
+  const isCapturing = ['requesting', 'recording'].includes(enrollState)
+    || ['requesting', 'recording'].includes(recState);
   const enrolled = Boolean(doctorInfo?.voice_enrolled);
   const sv = result?.speaker_verification;
 
@@ -477,7 +495,7 @@ export default function App() {
 
           <button
             id="re-enroll-toggle-btn"
-            onClick={() => setEnrollMode(p => !p)}
+            onClick={enrollMode ? closeEnrollment : () => setEnrollMode(true)}
             style={{
               background: enrollMode ? G.white : G.surface2,
               color: enrollMode ? G.pitchBlack : G.silverMid,
@@ -591,11 +609,7 @@ export default function App() {
                 </span>
               )}
               <button
-                onClick={() => {
-                  setEnrollMode(false);
-                  setEnrollState('idle');
-                  setEnrollError(null);
-                }}
+                onClick={closeEnrollment}
                 style={{
                   background: 'transparent',
                   border: `1px solid ${G.borderSubtle}`,
@@ -645,6 +659,7 @@ export default function App() {
                     <>
                       <button
                         onClick={() => startEnroll(true)}
+                        disabled={isCapturing}
                         style={{
                           background: G.white,
                           color: G.pitchBlack,
@@ -660,6 +675,7 @@ export default function App() {
                       </button>
                       <button
                         onClick={() => startEnroll(false)}
+                        disabled={isCapturing}
                         style={{
                           background: G.surface3,
                           color: G.white,
@@ -692,6 +708,7 @@ export default function App() {
                   ) : (
                     <button
                       onClick={() => startEnroll(true)}
+                      disabled={isCapturing}
                       style={{
                         background: G.white,
                         color: G.pitchBlack,
@@ -708,6 +725,8 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {enrollState === 'requesting' && <p role="status">Waiting for microphone permission…</p>}
 
               {enrollState === 'recording' && (
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, width: '100%' }}>
@@ -755,7 +774,7 @@ export default function App() {
                   </div>
 
                   <button
-                    onClick={stopEnroll}
+                    onClick={() => stopCapture('enroll', setEnrollState)}
                     disabled={enrollElapsed < MIN_ENROLL_SECS}
                     style={{
                       background: enrollElapsed >= MIN_ENROLL_SECS ? G.white : G.surface3,
@@ -915,6 +934,7 @@ export default function App() {
               <button
                 id="start-record-btn"
                 onClick={startRecording}
+                disabled={isCapturing}
                 style={{
                   width: 92,
                   height: 92,
@@ -976,11 +996,21 @@ export default function App() {
             </div>
           )}
 
+          {recState === 'requesting' && (
+            <div role="status">
+              <p>Waiting for microphone permission…</p>
+              <button type="button" onClick={resetRecorder}>Cancel Recording</button>
+            </div>
+          )}
+
           {/* RECORDING STATE */}
           {recState === 'recording' && (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16, padding: '16px 0' }}>
               <button
-                onClick={elapsed >= MIN_RECORD_SECS ? stopRecording : undefined}
+                id="stop-record-btn"
+                aria-label="Stop recording and process audio"
+                onClick={() => stopCapture('report', setRecState)}
+                disabled={elapsed < MIN_RECORD_SECS}
                 style={{
                   width: 92,
                   height: 92,

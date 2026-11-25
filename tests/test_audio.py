@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from main import app
 from audio.processor import validate_audio_content_type
 from audio.parser import parse_medical_report, _parse_with_regex
+from audio.transcriber import transcribe_audio
 from report.generator import generate_pdf_report, save_report_to_db, get_all_reports
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,26 @@ def test_generate_report_valid_audio(client):
     assert "medical_report" in data
     assert data["speaker_verification"]["verified"] is True
     assert data["pdf_url"] is not None
+
+
+def test_generate_report_rejects_empty_transcript(client):
+    with patch("main.transcribe_audio", return_value={"text": " "}):
+        response = client.post(
+            "/api/report/generate",
+            files={"file": ("consultation.wav", make_wav_bytes(), "audio/wav")},
+        )
+    assert response.status_code == 422
+    assert "No intelligible speech" in response.json()["detail"]
+
+
+def test_transcriber_skips_gemini_for_silence(tmp_path):
+    recording = tmp_path / "silent.wav"
+    recording.write_bytes(make_wav_bytes())
+    with patch("audio.transcriber._transcribe_with_gemini") as gemini:
+        result = transcribe_audio(recording)
+
+    assert result["text"] == ""
+    gemini.assert_not_called()
 
 
 def test_generate_report_missing_file(client):
