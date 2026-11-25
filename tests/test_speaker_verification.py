@@ -533,11 +533,12 @@ class TestVerification:
         ref_emb = np.random.randn(192).astype(np.float32)
         ref_emb = ref_emb / np.linalg.norm(ref_emb)
 
-        # Create an embedding with ~0.54 similarity
+        # Create an orthogonal noise vector so dot product is exact
         noise = np.random.randn(192).astype(np.float32)
+        noise = noise - np.dot(noise, ref_emb) * ref_emb
         noise = noise / np.linalg.norm(noise)
         cur_emb = 0.54 * ref_emb + np.sqrt(1 - 0.54**2) * noise
-        cur_emb = cur_emb / np.linalg.norm(cur_emb)
+        cur_emb = (cur_emb / np.linalg.norm(cur_emb)).astype(np.float32)
 
         mock_verifier = MagicMock()
         import torch

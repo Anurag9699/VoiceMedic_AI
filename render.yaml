@@ -11,4 +11,4 @@ services:
       - key: SPEAKER_VERIFICATION_THRESHOLD
         value: "0.55"
       - key: WHISPER_MODEL
-        value: "small"
+        value: "tiny"

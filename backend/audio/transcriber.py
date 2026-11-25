@@ -269,7 +269,7 @@ Return ONLY a valid JSON object matching this schema:
 
 def transcribe_audio(
     wav_path: Path,
-    model_name: str = "small",
+    model_name: str = "tiny",
     language: str | None = None,
     force_whisper: bool = False,
 ) -> dict:

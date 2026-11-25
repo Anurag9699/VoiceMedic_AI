@@ -4,9 +4,9 @@ import uuid
 import logging
 
 from pathlib import Path
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from audio.processor import (
     convert_to_16k_mono_wav,
@@ -24,7 +24,8 @@ BASE_DIR = Path(__file__).resolve().parent
 RAW_AUDIO_DIR = BASE_DIR / "data" / "audio" / "raw"
 WAV_AUDIO_DIR = BASE_DIR / "data" / "audio" / "wav_16k"
 
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+# Default to "tiny" model in cloud environments to avoid OOM memory crashes on 512MB RAM instances
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
 
 app = FastAPI(
     title="VoiceMedic AI — Medical Report Generator",
@@ -32,13 +33,45 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Robust CORS middleware allowing all web origins, Vercel preview domains, and standard REST methods
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Ensure CORS headers are always returned even when an unhandled 500 error occurs."""
+    logging.error(f"Global unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {exc}", "status": "error"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Ensure CORS headers are present on all HTTPExceptions (400, 404, 415, 500)."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
