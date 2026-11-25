@@ -1,11 +1,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || (
+const rawApiBase = import.meta.env.VITE_API_BASE_URL || (
   window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
     ? `http://${window.location.hostname}:8000`
     : ''
 );
+const API_BASE = rawApiBase.replace(/\/+$/, '');
 
 const MIN_ENROLL_SECS = 5;
 const MIN_RECORD_SECS = 3;

@@ -66,6 +66,12 @@ SUPPORTED_LANGUAGES: list[dict] = [
 # Health Check
 # ---------------------------------------------------------------------------
 
+@app.get("/", tags=["System"])
+def root():
+    """Root health check for cloud load balancers and deployment verification."""
+    return {"status": "ok", "system": "VoiceMedic AI", "docs": "/docs"}
+
+
 @app.get("/health", tags=["System"])
 def get_health():
     """Simple health-check endpoint."""
