@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from main import app
 from audio.processor import validate_audio_content_type
 from audio.parser import parse_medical_report, _parse_with_regex
-from audio.transcriber import transcribe_audio
+from audio.transcriber import SpeechServiceUnavailable, transcribe_audio
 from report.generator import generate_pdf_report, save_report_to_db, get_all_reports
 
 # ---------------------------------------------------------------------------
@@ -156,6 +156,22 @@ def test_generate_report_rejects_empty_transcript(client):
         )
     assert response.status_code == 422
     assert "No intelligible speech" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(("quota_reached", "status"), [(True, 429), (False, 503)])
+def test_report_can_retry_when_transcription_is_unavailable(client, quota_reached, status):
+    with (
+        patch("main.transcribe_audio", side_effect=SpeechServiceUnavailable(quota_reached)),
+        patch("main.verify_speaker") as verify,
+    ):
+        response = client.post(
+            "/api/report/generate",
+            files={"file": ("consultation.wav", make_wav_bytes(), "audio/wav")},
+        )
+    assert response.status_code == status
+    assert response.json()["code"] == "transcription_unavailable"
+    assert "Try this recording again" in response.json()["detail"]
+    verify.assert_not_called()
 
 
 def test_transcriber_skips_gemini_for_silence(tmp_path):

@@ -13,7 +13,7 @@ from audio.processor import (
     save_upload_file,
     validate_audio_content_type,
 )
-from audio.transcriber import transcribe_audio
+from audio.transcriber import SpeechServiceUnavailable, transcribe_audio
 from audio.parser import parse_medical_report
 from audio.speaker import verify_speaker, reset_enrollment, enroll_speaker, DEFAULT_THRESHOLD
 from report.generator import generate_pdf_report, save_report_to_db, get_all_reports
@@ -182,8 +182,8 @@ async def generate_report(
     Pipeline:
     1. Validate & save audio
     2. Convert to 16kHz WAV (ffmpeg)
-    3. Verify doctor's voice (ECAPA-TDNN)
-    4. Transcribe speech to text (Whisper)
+    3. Transcribe speech to text
+    4. Verify doctor's voice (ECAPA-TDNN)
     5. Extract medical data (Gemini LLM)
     6. Generate PDF report (reportlab)
     7. Save to database (SQLite)
@@ -205,10 +205,7 @@ async def generate_report(
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Step 3: Verify doctor's voice
-    speaker_data = verify_speaker(str(wav_path), user_id="default_doctor")
-
-    # Step 4: Transcribe speech to text
+    # Step 3: Transcribe speech to text before running speaker verification
     # Map "auto" sentinel to None so the transcriber triggers language auto-detection
     whisper_language: str | None = None if language == "auto" else language
     try:
@@ -216,6 +213,11 @@ async def generate_report(
             wav_path,
             model_name=WHISPER_MODEL,
             language=whisper_language,
+        )
+    except SpeechServiceUnavailable as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"detail": str(e), "code": "transcription_unavailable"},
         )
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
@@ -228,6 +230,9 @@ async def generate_report(
         )
     english_translation = transcription.get("english_translation", transcript_text).strip()
     detected_lang = transcription.get("language", "en")
+
+    # Step 4: Verify doctor's voice
+    speaker_data = verify_speaker(str(wav_path), user_id="default_doctor")
 
     # Step 5: Extract medical data using Gemini LLM
     # If spoken in a regional language, provide both native transcript and English translation for clinical precision

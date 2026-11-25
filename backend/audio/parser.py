@@ -34,11 +34,20 @@ def get_gemini_client():
     global _gemini_client
     if _gemini_client is not None:
         return _gemini_client
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return None
     try:
         from google import genai
-        api_key = os.getenv("GEMINI_API_KEY")
-        if api_key:
-            _gemini_client = genai.Client(api_key=api_key)
+        from google.genai import types
+
+        _gemini_client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=15_000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
     except Exception as e:
         logging.warning(f"Could not initialize Gemini client: {e}")
         _gemini_client = None

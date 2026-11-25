@@ -34,7 +34,9 @@ function releaseCapture(captureRef) {
 async function readApiResponse(response) {
   const data = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(data?.detail || `The server returned HTTP ${response.status}. Please try again.`);
+    const error = new Error(data?.detail || `The server returned HTTP ${response.status}. Please try again.`);
+    error.code = data?.code;
+    throw error;
   }
   if (!data) throw new Error('The voice API did not return JSON. Check the backend URL.');
   return data;
@@ -227,6 +229,7 @@ export default function App() {
   const [recState, setRecState] = useState('idle');
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [retryRecording, setRetryRecording] = useState(null);
   const [elapsed, setElapsed] = useState(0);
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -389,6 +392,7 @@ export default function App() {
 
   const startRecording = () => {
     setResult(null);
+    setRetryRecording(null);
     startCapture({
       kind: 'report',
       setState: setRecState,
@@ -405,13 +409,17 @@ export default function App() {
     setRecState('idle');
     setResult(null);
     setError(null);
+    setRetryRecording(null);
     setElapsed(0);
   };
 
-  const uploadAudio = async blob => {
+  const uploadAudio = async (blob, language = selectedLanguage) => {
+    setError(null);
+    setRetryRecording(null);
+    setRecState('uploading');
     const fd = new FormData();
     attachRecording(fd, blob, 'recording');
-    fd.append('language', selectedLanguage);
+    fd.append('language', language);
 
     try {
       const r = await fetch(`${API_BASE}/api/report/generate`, { method: 'POST', body: fd });
@@ -422,6 +430,7 @@ export default function App() {
       fetchHistory();
     } catch (err) {
       setError(`Processing failed: ${err.message}`);
+      if (err.code === 'transcription_unavailable') setRetryRecording({ blob, language });
       setRecState('idle');
     }
   };
@@ -883,7 +892,7 @@ export default function App() {
                 fontFamily: "'JetBrains Mono', monospace",
               }}
             >
-              Whisper · Gemini 2.5
+              Whisper · Gemini
             </span>
           </div>
 
@@ -1511,6 +1520,23 @@ export default function App() {
               }}
             >
               ⚠ {error}
+              {retryRecording && (
+                <button
+                  type="button"
+                  onClick={() => uploadAudio(retryRecording.blob, retryRecording.language)}
+                  style={{
+                    marginLeft: 12,
+                    border: `1px solid ${G.borderStrong}`,
+                    borderRadius: 6,
+                    background: G.surface3,
+                    color: G.white,
+                    padding: '5px 9px',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Retry recording
+                </button>
+              )}
             </div>
           )}
         </Card>

@@ -187,7 +187,16 @@ def get_whisper_model(model_name: str = "small"):
 # SOTA Multilingual ASR (Gemini Multimodal Audio)
 # ---------------------------------------------------------------------------
 
-_last_gemini_error: str | None = None
+class SpeechServiceUnavailable(RuntimeError):
+    def __init__(self, quota_reached: bool = False):
+        self.status_code = 429 if quota_reached else 503
+        message = (
+            "The transcription service has reached its usage limit. Try this recording again later."
+            if quota_reached
+            else "The transcription service is temporarily unavailable. Try this recording again in a moment."
+        )
+        super().__init__(message)
+
 
 def _transcribe_with_gemini(
     wav_path: Path,
@@ -199,20 +208,24 @@ def _transcribe_with_gemini(
     Tamil, Telugu, Gujarati, Kannada, Malayalam, Bengali, Punjabi, Urdu, Odia)
     and Indian English, where standard Whisper models suffer high word error rates.
     """
-    global _last_gemini_error
     api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
-        _last_gemini_error = "GEMINI_API_KEY environment variable is not configured or empty"
         return None
 
     try:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=api_key)
-
-        with open(wav_path, "rb") as f:
-            audio_bytes = f.read()
+        audio_bytes = wav_path.read_bytes()
+        # Audio is 16 kHz, mono, 16-bit PCM. Allow longer clips more time.
+        timeout_ms = min(60_000, 15_000 + len(audio_bytes) // 64)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=timeout_ms,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
 
         lang_hint = (
             f"The selected language code is {language}. Use it as a hint."
@@ -232,31 +245,31 @@ Return a JSON object with text, language, language_name, english_translation, an
 Use the primary spoken language for language and language_name, and give confidence as a number from 0 to 1.
 """
         response = None
-        last_exc = None
+        failures = []
         used_model = None
 
-        for m in GEMINI_MODELS:
-            try:
-                response = client.models.generate_content(
-                    model=m,
-                    contents=[
-                        types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                        prompt,
-                    ],
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
-                )
-                if response and response.text:
-                    used_model = m
-                    break
-            except Exception as e:
-                last_exc = e
-                logger.warning(f"Gemini model '{m}' call failed: {e}. Trying fallback model...")
+        with client:
+            for model in GEMINI_MODELS:
+                try:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=[
+                            types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                            prompt,
+                        ],
+                        config=types.GenerateContentConfig(response_mime_type="application/json"),
+                    )
+                    if response and response.text:
+                        used_model = model
+                        break
+                    failures.append(None)
+                except Exception as exc:
+                    status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                    failures.append(status_code)
+                    logger.warning("Gemini transcription model %s failed: %s", model, status_code or type(exc).__name__)
 
         if response is None or not response.text:
-            if last_exc:
-                raise last_exc
-            _last_gemini_error = "Gemini returned empty transcription response"
-            return None
+            raise SpeechServiceUnavailable(quota_reached=all(code == 429 for code in failures))
 
         resp_text = response.text.strip()
         if resp_text.startswith("```"):
@@ -282,10 +295,11 @@ Use the primary spoken language for language and language_name, and give confide
             "model_used": f"{used_model or 'gemini'} (multimodal ASR)",
             "confidence": float(data.get("confidence", 0.0 if not text else 0.95)),
         }
-    except Exception as e:
-        _last_gemini_error = f"{type(e).__name__}: {e}"
-        logger.warning(f"Gemini multimodal ASR unavailable/failed: {e}. Falling back to Whisper.")
-        return None
+    except SpeechServiceUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("Gemini transcription failed: %s", type(exc).__name__)
+        raise SpeechServiceUnavailable() from exc
 
 
 # ---------------------------------------------------------------------------
@@ -336,22 +350,19 @@ def transcribe_audio(
             "model_used": None,
         }
 
-    # Step 1: Gemini multimodal transcription
-    if not force_whisper:
-        gemini_result = _transcribe_with_gemini(wav_path, language=language)
-        if gemini_result is not None:
-            logger.info("Transcription completed with %s.", gemini_result.get("model_used", "Gemini"))
-            return gemini_result
-
-    # Cloud environment memory protection:
-    # On Render free tier (512MB RAM), attempting to load local Whisper triggers Linux OOM (exit code 137).
+    # Keep Whisper disabled on memory-constrained cloud instances.
     is_cloud = bool(os.getenv("RENDER") or os.getenv("ENVIRONMENT") == "production")
+    if not force_whisper:
+        try:
+            gemini_result = _transcribe_with_gemini(wav_path, language=language)
+            if gemini_result is not None:
+                logger.info("Transcription completed with %s.", gemini_result.get("model_used", "Gemini"))
+                return gemini_result
+        except SpeechServiceUnavailable:
+            if is_cloud:
+                raise
     if is_cloud:
-        error_detail = _last_gemini_error or "ASR failed"
-        raise RuntimeError(
-            f"Gemini multimodal ASR failed ({error_detail}). "
-            "Local Whisper fallback is disabled in cloud hosting to prevent memory exhaustion (512MB RAM limit)."
-        )
+        raise SpeechServiceUnavailable()
 
     # Step 2: Fallback to local Whisper
     logger.info("Using Whisper ASR engine (fallback or forced).")
