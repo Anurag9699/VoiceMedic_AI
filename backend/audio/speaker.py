@@ -59,10 +59,21 @@ def get_verifier() -> Optional["SpeakerRecognition"]:
     global _verifier_model
     if _verifier_model is None and SpeakerRecognition is not None:
         logging.info("Loading SpeechBrain ECAPA-TDNN model...")
+        if torch is not None:
+            torch.set_grad_enabled(False)
+            try:
+                torch.set_num_threads(1)
+            except Exception:
+                pass
         _verifier_model = SpeakerRecognition.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir=str(BASE_DIR / "pretrained_models" / "spkrec-ecapa-voxceleb"),
+            run_opts={"device": "cpu"},
         )
+        if hasattr(_verifier_model, "mods") and hasattr(_verifier_model.mods, "classifier"):
+            del _verifier_model.mods.classifier
+        import gc
+        gc.collect()
     return _verifier_model
 
 

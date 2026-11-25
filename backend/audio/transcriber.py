@@ -306,6 +306,16 @@ def transcribe_audio(
             logger.info("Transcription completed with Gemini 2.5 Flash multimodal ASR.")
             return gemini_result
 
+    # Cloud environment memory protection:
+    # On Render free tier (512MB RAM), attempting to load local Whisper triggers Linux OOM (exit code 137).
+    is_cloud = bool(os.getenv("RENDER") or os.getenv("ENVIRONMENT") == "production")
+    if is_cloud:
+        raise RuntimeError(
+            "Gemini multimodal ASR failed or GEMINI_API_KEY is not configured in Render. "
+            "Local Whisper fallback is disabled in cloud hosting to prevent memory exhaustion (512MB RAM limit). "
+            "Please configure GEMINI_API_KEY in your Render dashboard environment variables."
+        )
+
     # Step 2: Fallback to local Whisper
     logger.info("Using Whisper ASR engine (fallback or forced).")
     model = get_whisper_model(model_name)

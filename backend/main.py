@@ -107,8 +107,13 @@ def root():
 
 @app.get("/health", tags=["System"])
 def get_health():
-    """Simple health-check endpoint."""
-    return {"status": "ok", "system": "VoiceMedic AI"}
+    """Simple health-check endpoint reporting system status and environment readiness."""
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    return {
+        "status": "ok",
+        "system": "VoiceMedic AI",
+        "gemini_configured": bool(gemini_key),
+    }
 
 
 # ---------------------------------------------------------------------------
