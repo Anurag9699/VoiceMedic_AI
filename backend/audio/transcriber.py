@@ -179,21 +179,25 @@ def get_whisper_model(model_name: str = "small"):
 
 
 # ---------------------------------------------------------------------------
-# SOTA Multilingual ASR (Gemini 2.5 Flash Multimodal Audio)
+# SOTA Multilingual ASR (Gemini Multimodal Audio)
 # ---------------------------------------------------------------------------
+
+_last_gemini_error: str | None = None
 
 def _transcribe_with_gemini(
     wav_path: Path,
     language: str | None = None,
 ) -> dict | None:
     """
-    State-of-the-art multilingual ASR using Gemini 2.5 Flash multimodal audio.
+    State-of-the-art multilingual ASR using Gemini multimodal audio.
     Provides human-grade accuracy for Indic regional languages (Marathi, Hindi,
     Tamil, Telugu, Gujarati, Kannada, Malayalam, Bengali, Punjabi, Urdu, Odia)
     and Indian English, where standard Whisper models suffer high word error rates.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    global _last_gemini_error
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
+        _last_gemini_error = "GEMINI_API_KEY environment variable is not configured or empty"
         return None
 
     try:
@@ -232,21 +236,47 @@ Return ONLY a valid JSON object matching this schema:
   "confidence": <float between 0.0 and 1.0>
 }}
 """
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                prompt,
-            ],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
+        models_to_try = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-flash-lite-latest"]
+        response = None
+        last_exc = None
+        used_model = None
 
-        data = json.loads(response.text)
-        text = (data.get("text") or "").strip()
-        if not text:
+        for m in models_to_try:
+            try:
+                response = client.models.generate_content(
+                    model=m,
+                    contents=[
+                        types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                if response and response.text:
+                    used_model = m
+                    break
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"Gemini model '{m}' call failed: {e}. Trying fallback model...")
+
+        if response is None or not response.text:
+            if last_exc:
+                raise last_exc
+            _last_gemini_error = "Gemini returned empty transcription response"
             return None
 
-        detected_lang = data.get("language") or language or "unknown"
+        resp_text = response.text.strip()
+        if resp_text.startswith("```"):
+            lines = resp_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            resp_text = "\n".join(lines).strip()
+
+        data = json.loads(resp_text) if resp_text else {}
+        text = (data.get("text") or "").strip()
+
+        detected_lang = data.get("language") or language or "en"
         english_trans = (data.get("english_translation") or text).strip()
 
         return {
@@ -254,11 +284,12 @@ Return ONLY a valid JSON object matching this schema:
             "language": detected_lang,
             "language_name": data.get("language_name", detected_lang),
             "english_translation": english_trans,
-            "segments": [{"start": 0.0, "end": 0.0, "text": text}],
-            "model_used": "gemini-2.5-flash (multimodal ASR)",
-            "confidence": float(data.get("confidence", 0.95)),
+            "segments": [{"start": 0.0, "end": 0.0, "text": text}] if text else [],
+            "model_used": f"{used_model or 'gemini'} (multimodal ASR)",
+            "confidence": float(data.get("confidence", 0.0 if not text else 0.95)),
         }
     except Exception as e:
+        _last_gemini_error = f"{type(e).__name__}: {e}"
         logger.warning(f"Gemini multimodal ASR unavailable/failed: {e}. Falling back to Whisper.")
         return None
 
@@ -310,10 +341,10 @@ def transcribe_audio(
     # On Render free tier (512MB RAM), attempting to load local Whisper triggers Linux OOM (exit code 137).
     is_cloud = bool(os.getenv("RENDER") or os.getenv("ENVIRONMENT") == "production")
     if is_cloud:
+        error_detail = _last_gemini_error or "ASR failed"
         raise RuntimeError(
-            "Gemini multimodal ASR failed or GEMINI_API_KEY is not configured in Render. "
-            "Local Whisper fallback is disabled in cloud hosting to prevent memory exhaustion (512MB RAM limit). "
-            "Please configure GEMINI_API_KEY in your Render dashboard environment variables."
+            f"Gemini multimodal ASR failed ({error_detail}). "
+            "Local Whisper fallback is disabled in cloud hosting to prevent memory exhaustion (512MB RAM limit)."
         )
 
     # Step 2: Fallback to local Whisper

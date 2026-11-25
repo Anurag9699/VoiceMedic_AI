@@ -163,15 +163,36 @@ Return ONLY this JSON (no markdown, no explanation):
     "is_valid": <true if ANY useful clinical info found — name, symptoms, age, or diagnosis — else false>
 }}
 """
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
+            response = None
+            last_err = None
+            for m in ['gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest']:
+                try:
+                    response = client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    if response and response.text:
+                        break
+                except Exception as me:
+                    last_err = me
+                    logging.warning(f"Gemini parser with {m} failed: {me}")
 
-            data = json.loads(response.text)
+            if not response or not response.text:
+                raise last_err or RuntimeError("No response from Gemini LLM parser")
+
+            resp_text = response.text.strip()
+            if resp_text.startswith("```"):
+                lines = resp_text.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                resp_text = "\n".join(lines).strip()
+
+            data = json.loads(resp_text)
             data["method"] = "gemini_llm"
             # Ensure array fields are lists
             data["symptoms"] = data.get("symptoms") or []
