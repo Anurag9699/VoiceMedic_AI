@@ -51,15 +51,15 @@ def _parse_with_regex(transcript: str) -> Dict[str, Any]:
 
     # Try to find age
     age = None
-    age_match = re.search(r'(\d+)\s*(?:year|yr|years)', t)
+    age_match = re.search(r'\b(\d+)[\s-]*(?:years?|yrs?)\b', t)
     if age_match:
         age = int(age_match.group(1))
 
     # Gender
     gender = None
-    if any(w in t for w in ['male', 'man', 'boy', 'mr']):
+    if re.search(r'\b(?:male|man|boy|mr)\b', t):
         gender = 'Male'
-    elif any(w in t for w in ['female', 'woman', 'girl', 'mrs', 'ms']):
+    elif re.search(r'\b(?:female|woman|girl|mrs|ms)\b', t):
         gender = 'Female'
 
     return {

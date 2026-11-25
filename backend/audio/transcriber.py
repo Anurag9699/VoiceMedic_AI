@@ -360,7 +360,9 @@ def transcribe_audio(
 
     try:
         if _model_backend == "faster_whisper":
-            res = _transcribe_faster_whisper(model, wav_path, language, initial_prompt)
+            # The API has already decoded the file to 16 kHz mono PCM.
+            waveform = samples.astype(np.float32) / 32768.0
+            res = _transcribe_faster_whisper(model, waveform, language, initial_prompt)
         else:
             res = _transcribe_openai_whisper(model, wav_path, language, initial_prompt)
         # Ensure english_translation is populated
@@ -377,7 +379,7 @@ def transcribe_audio(
 
 def _transcribe_faster_whisper(
     model,
-    wav_path: Path,
+    waveform: np.ndarray,
     language: str | None,
     initial_prompt: str,
 ) -> dict:
@@ -392,7 +394,7 @@ def _transcribe_faster_whisper(
     if language is not None:
         kwargs["language"] = language
 
-    segments_gen, info = model.transcribe(str(wav_path), **kwargs)
+    segments_gen, info = model.transcribe(waveform, **kwargs)
 
     segments_list = []
     full_text_parts = []

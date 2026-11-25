@@ -2,13 +2,14 @@ import io
 import sys
 import wave
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Add backend directory to sys.path
 BACKEND_DIR = Path(__file__).resolve().parent.parent / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from main import app
@@ -167,6 +168,27 @@ def test_transcriber_skips_gemini_for_silence(tmp_path):
     gemini.assert_not_called()
 
 
+def test_local_whisper_uses_decoded_pcm(tmp_path, monkeypatch):
+    monkeypatch.delenv("RENDER", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    recording = tmp_path / "speech.wav"
+    with wave.open(str(recording), "wb") as file:
+        file.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+        file.writeframes(b"\x00\x40" * 16000)
+
+    model = Mock()
+    model.transcribe.return_value = ([Mock(text="Test phrase", start=0, end=1)], Mock(language="en"))
+    with patch("audio.transcriber.get_whisper_model", return_value=model), \
+         patch("audio.transcriber._model_backend", "faster_whisper"):
+        result = transcribe_audio(recording, force_whisper=True)
+
+    waveform = model.transcribe.call_args.args[0]
+    assert waveform.dtype == np.float32
+    assert waveform.shape == (16000,)
+    np.testing.assert_allclose(waveform, 0.5)
+    assert result["text"] == "Test phrase"
+
+
 def test_generate_report_missing_file(client):
     """POST /api/report/generate without file returns 422."""
     response = client.post("/api/report/generate")
@@ -217,12 +239,15 @@ def test_validate_audio_content_type():
     assert validate_audio_content_type("text/plain") is False
 
 
-def test_medical_parser_regex_fallback():
+@pytest.mark.parametrize(("transcript", "age", "gender"), [
+    ("Patient is a 55 year old male complaining of severe fever.", 55, "Male"),
+    ("The patient is a 40-year-old female.", 40, "Female"),
+])
+def test_medical_parser_regex_fallback(transcript, age, gender):
     """Verify regex fallback parser extracts basic patient info."""
-    transcript = "Patient is a 55 year old male complaining of severe fever."
     data = _parse_with_regex(transcript)
-    assert data["age"] == 55
-    assert data["gender"] == "Male"
+    assert data["age"] == age
+    assert data["gender"] == gender
     assert data["is_valid"] is True
 
 
